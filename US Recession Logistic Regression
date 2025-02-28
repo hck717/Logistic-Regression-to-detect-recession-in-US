@@ -1,1 +1,235 @@
+!pip install pandas numpy matplotlib seaborn scikit-learn statsmodels fredapi
 
+
+# Set up inline plotting for Jupyter
+%matplotlib inline
+
+import numpy as np
+import pandas as pd
+from fredapi import Fred
+from sklearn.linear_model import LogisticRegression
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix
+from sklearn.model_selection import GridSearchCV
+from sklearn.decomposition import PCA
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Initialize FRED API
+fred = Fred(api_key='2e978cd1b8ac041452388ed44ac1dcd6')
+
+# Step 1: Fetch CEI component data from FRED (1960–2025)
+start_date = '1960-01-01'
+end_date = '2025-2-24'
+quarterly_dates = pd.date_range(start=start_date, end=end_date, freq='QE')
+
+print("Fetching Payroll Employment (PAYEMS)...")
+payroll = fred.get_series('PAYEMS', start_date, end_date).resample('QE').mean()
+payroll = payroll.pct_change(1) * 100
+payroll = payroll.reindex(quarterly_dates, method='ffill').dropna()
+
+print("Fetching Personal Income Less Transfers (W875RX1)...")
+income = fred.get_series('W875RX1', start_date, end_date).resample('QE').mean()
+income = income.pct_change(1) * 100
+income = income.reindex(quarterly_dates, method='ffill').dropna()
+
+print("Fetching Manufacturing and Trade Sales (CMRMTSPL)...")
+sales = fred.get_series('CMRMTSPL', start_date, end_date).resample('QE').mean()
+sales = sales.pct_change(1) * 100
+sales = sales.reindex(quarterly_dates, method='ffill').dropna()
+
+print("Fetching Industrial Production (INDPRO)...")
+indprod = fred.get_series('INDPRO', start_date, end_date).resample('QE').mean()
+indprod = indprod.pct_change(1) * 100
+indprod = indprod.reindex(quarterly_dates, method='ffill').dropna()
+
+common_dates = payroll.index.intersection(income.index).intersection(sales.index).intersection(indprod.index)
+if len(common_dates) == 0:
+    raise ValueError("No common dates found.")
+
+data = pd.DataFrame({
+    'Date': common_dates,
+    'Payroll_Employment': payroll.loc[common_dates],
+    'Personal_Income_Less_Transfers': income.loc[common_dates],
+    'Manufacturing_Trade_Sales': sales.loc[common_dates],
+    'Industrial_Production': indprod.loc[common_dates]
+}).dropna()
+
+nber_recession = fred.get_series('USRECQ', start_date, end_date).reindex(common_dates, method='ffill')
+data['Recession'] = nber_recession.fillna(0)
+
+# Footnote 1: Fetches CEI components from FRED, converts to quarterly % changes, aligns on common dates, and adds NBER recession labels.
+
+# Step 2: Feature engineering
+data["Payroll_Lag"] = data["Payroll_Employment"].shift(1)
+data["Income_Lag"] = data["Personal_Income_Less_Transfers"].shift(1)
+data["Payroll_Income_Interaction"] = data["Payroll_Employment"] * data["Personal_Income_Less_Transfers"]
+data = data.dropna()
+
+forecast_dates = pd.date_range(start='2025-03-31', end='2025-12-31', freq='QE')
+forecast_data = pd.DataFrame({
+    'Date': forecast_dates,
+    'Payroll_Employment': [0.3, 0.3, 0.4, 0.3],
+    'Personal_Income_Less_Transfers': [0.5, 0.6, 0.6, 0.5],
+    'Manufacturing_Trade_Sales': [0.4, 0.5, 0.5, 0.4],
+    'Industrial_Production': [0.3, 0.4, 0.4, 0.3],
+    'Recession': [0, 0, 0, 0]
+})
+forecast_data["Payroll_Lag"] = forecast_data["Payroll_Employment"].shift(1)
+forecast_data["Income_Lag"] = forecast_data["Personal_Income_Less_Transfers"].shift(1)
+forecast_data["Payroll_Income_Interaction"] = forecast_data["Payroll_Employment"] * forecast_data["Personal_Income_Less_Transfers"]
+full_data = pd.concat([data, forecast_data]).dropna()
+
+# Footnote 2: Adds lagged features and an interaction term, then appends 2025 forecast data.
+
+features = ["Payroll_Employment", "Personal_Income_Less_Transfers", "Manufacturing_Trade_Sales",
+            "Industrial_Production", "Payroll_Lag", "Income_Lag", "Payroll_Income_Interaction"]
+X = full_data[features]
+y = full_data["Recession"]
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+# Step 3: Optimize C parameter with GridSearchCV
+param_grid = {'C': [0.001, 0.01, 0.1, 1.0, 10, 100]}
+grid_search = GridSearchCV(LogisticRegression(solver="lbfgs", penalty="l2", max_iter=1000),
+                           param_grid, cv=5, scoring='accuracy', return_train_score=True)
+grid_search.fit(X_scaled, y)
+best_C = grid_search.best_params_['C']
+print(f"\nOptimal C: {best_C}")
+print(f"Best Cross-Validation Accuracy: {grid_search.best_score_:.4f}")
+
+# Variance and fitting analysis
+cv_results = pd.DataFrame(grid_search.cv_results_)
+print("\nC Parameter Impact on Variance/Fitting:")
+print(cv_results[['param_C', 'mean_train_score', 'mean_test_score']])
+
+# Footnote 3: Uses GridSearchCV to find optimal C, assessing variance (train vs. test scores) and model fit.
+
+# Step 4: Backtesting with optimal C
+train_size = int(len(X) * 0.7)
+test_size = 4
+predictions = []
+actuals = []
+probs = []
+test_dates = []
+
+for i in range(train_size, len(X) - test_size + 1, test_size):
+    X_train = X_scaled[:i]
+    y_train = y.iloc[:i]
+    X_test = X_scaled[i:i + test_size]
+    y_test = y.iloc[i:i + test_size]
+    model = LogisticRegression(solver="lbfgs", penalty="l2", C=best_C, max_iter=1000)
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_test)
+    y_prob = model.predict_proba(X_test)[:, 1]
+    predictions.extend(y_pred)
+    actuals.extend(y_test)
+    probs.extend(y_prob)
+    test_dates.extend(full_data["Date"].iloc[i:i + test_size])
+
+full_model = LogisticRegression(solver="lbfgs", penalty="l2", C=best_C, max_iter=1000)
+full_model.fit(X_scaled, y)
+full_probs = full_model.predict_proba(X_scaled)[:, 1]
+
+# Footnote 4: Backtests with the optimal C value, predicting recessions over the full period.
+
+# Step 5: Evaluate performance
+accuracy = accuracy_score(actuals, predictions)
+roc_auc = roc_auc_score(actuals, probs) if len(np.unique(actuals)) > 1 else "N/A"
+conf_matrix = confusion_matrix(actuals, predictions)
+
+print("\nModel Performance (Backtest 1960–2025):")
+print(f"Accuracy: {accuracy:.4f}")
+print(f"ROC-AUC Score: {roc_auc}")
+print("Confusion Matrix:")
+print(conf_matrix)
+
+# Footnote 5: Evaluates model performance metrics with the optimized C parameter.
+
+# Step 6: Visualizations
+# Visualization 1: Time Series of CEI Components
+plt.figure(figsize=(15, 10))
+for i, feature in enumerate(['Payroll_Employment', 'Personal_Income_Less_Transfers',
+                             'Manufacturing_Trade_Sales', 'Industrial_Production'], 1):
+    plt.subplot(4, 1, i)
+    plt.plot(full_data["Date"], full_data[feature], color=['purple', 'green', 'orange', 'blue'][i-1])
+    plt.title(f"{feature.replace('_', ' ')} (% Change QoQ)")
+plt.tight_layout()
+plt.show()
+
+# Visualization 2: Full Backtest (1970–2025)
+plt.figure(figsize=(15, 6))
+plt.plot(full_data["Date"], full_probs, label="Predicted Recession Probability", color="blue")
+plt.plot(full_data["Date"], full_data["Recession"], label="Actual Recession (NBER)", color="red", alpha=0.5)
+plt.axhline(y=0.5, color="gray", linestyle="--", label="Threshold (0.5)")
+plt.title("U.S. Recession Prediction (1970–2025) using CEI Components")
+plt.xlabel("Date")
+plt.ylabel("Probability / Recession Indicator")
+plt.legend()
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# Visualization 3: 2025 Prediction
+plt.figure(figsize=(8, 5))
+plt.plot(forecast_data["Date"], full_probs[-4:], label="Predicted Recession Probability", color="blue", marker='o')
+plt.plot(forecast_data["Date"], forecast_data["Recession"], label="Assumed Recession (Forecast)", color="red", alpha=0.5, marker='o')
+plt.axhline(y=0.5, color="gray", linestyle="--", label="Threshold (0.5)")
+plt.title("U.S. Recession Prediction (2025) using CEI Components")
+plt.xlabel("Date")
+plt.ylabel("Probability / Recession Indicator")
+plt.legend()
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# Visualization 4: Feature Importance
+coef = pd.Series(full_model.coef_[0], index=features)
+plt.figure(figsize=(10, 5))
+coef.plot(kind='bar', color='teal')
+plt.title("Feature Importance (Logistic Regression Coefficients)")
+plt.xlabel("Feature")
+plt.ylabel("Coefficient Value")
+plt.tight_layout()
+plt.show()
+
+# Visualization 5: Correlation Heatmap
+plt.figure(figsize=(10, 8))
+sns.heatmap(full_data[features].corr(), annot=True, cmap='coolwarm', center=0)
+plt.title("Correlation Matrix of CEI Features")
+plt.tight_layout()
+plt.show()
+
+# Visualization 6: Confusion Matrix Heatmap
+plt.figure(figsize=(6, 5))
+sns.heatmap(conf_matrix, annot=True, fmt='d', cmap='Blues', cbar=False)
+plt.title("Confusion Matrix (Backtest Period)")
+plt.xlabel("Predicted")
+plt.ylabel("Actual")
+plt.tight_layout()
+plt.show()
+
+# Visualization 7: Decision Boundary with PCA
+pca = PCA(n_components=2)
+X_pca = pca.fit_transform(X_scaled)
+model_pca = LogisticRegression(solver="lbfgs", penalty="l2", C=best_C, max_iter=1000)
+model_pca.fit(X_pca, y)
+
+xx, yy = np.meshgrid(np.linspace(X_pca[:, 0].min() - 1, X_pca[:, 0].max() + 1, 100),
+                     np.linspace(X_pca[:, 1].min() - 1, X_pca[:, 1].max() + 1, 100))
+Z = model_pca.predict_proba(np.c_[xx.ravel(), yy.ravel()])[:, 1]
+Z = Z.reshape(xx.shape)
+
+plt.figure(figsize=(10, 8))
+plt.contourf(xx, yy, Z, levels=20, cmap='RdBu', alpha=0.5)
+plt.colorbar(label='Probability')
+plt.scatter(X_pca[:, 0], X_pca[:, 1], c=y, cmap='RdBu', edgecolor='k')
+plt.title("Decision Boundary (PCA Reduced to 2D)")
+plt.xlabel("Principal Component 1")
+plt.ylabel("Principal Component 2")
+plt.tight_layout()
+plt.show()
+
+# Footnote 6: Visualizes CEI trends, recession predictions, feature importance, correlations, confusion matrix, and decision boundary using PCA.
